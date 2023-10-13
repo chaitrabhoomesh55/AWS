@@ -1,0 +1,45 @@
+#1. Get the frequency count of each letter for the given string ignoring spaces, upper and lower cases.
+'''
+s = '  __blissfFFullness__  '
+for i in s:
+    if i in [' ', '_']:
+        
+
+        print(f' {i}: {s.count(i)}')
+
+'''
+
+#2. Read a json file and convert to python dictinoary
+import json
+
+# String with JSON format
+data_JSON = '''
+{
+	7689: "Medium",
+	"price": 15.67,
+	"toppings": ["Mushrooms", "Extra Cheese", "Pepperoni", "Basil"],
+	"client": {
+		"name": "Jane Doe",
+		"phone": "455-344-234",
+		"email": "janedoe@email.com"
+	}
+}
+'''
+#covert json to dict:
+jdict = json.loads(data_JSON)
+print("JDICT", jdict)
+
+
+#3. convert python dictinary to json file
+data_dict = {4565: 'Medium', 'price': 15.67, 'toppings': ['Mushrooms', 'Extra Cheese', 'Pepperoni', 'Basil'], 'client': {'name': 'Jane Doe', 'phone': '455-344-234', 'email': 'janedoe@email.com'}}
+#covert dict to json:
+djson = json.dumps(data_dict)
+print("DJSON", djson)
+
+
+#4. write a script that takes inputs as arguments
+a = input("enter a value for a:")
+print(a)
+
+print()
+

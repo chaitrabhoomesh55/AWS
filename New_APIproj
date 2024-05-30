@@ -1,0 +1,447 @@
+import argparse
+import configparser
+import copy
+import json
+import logging
+import os
+import datetime
+import socket
+ 
+import duo_client
+from confluent_kafka import Producer
+from confluent_kafka.serialization import StringSerializer, SerializationContext, MessageField
+from confluent_kafka.schema_registry import SchemaRegistryClient
+from confluent_kafka.schema_registry.avro import AvroSerializer
+from tzlocal import get_localzone
+import oracledb
+import RDBMS.Vertica_Connector as vconn
+import requests
+import csv
+import pandas as pd
+import duo_client as duo
+import numpy as np
+ 
+def configurator(projectName, directoryPath):
+    config = configparser.ConfigParser(interpolation=None)
+    config.sections()
+    config.read(f'{directoryPath}/{projectName}.ini')
+    config.sections()
+    return config
+ 
+ 
+def loggingFunction(projectName, directoryPath, todaysDate):
+    logger = logging.getLogger()
+    logger.setLevel((logging.DEBUG))
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+ 
+    consoleHandler = logging.StreamHandler()
+    consoleHandler.setLevel(logging.INFO)
+    consoleHandler.setFormatter(formatter)
+ 
+    fileHandler = logging.FileHandler(f"{directoryPath}/{projectName}_{todaysDate}.log")
+    fileHandler.setLevel(logging.DEBUG)
+    fileHandler.setFormatter(formatter)
+ 
+    logger.addHandler(consoleHandler)
+    logger.addHandler(fileHandler)
+    return logger
+ 
+def makePath(newPath):
+    if not os.path.exists(os.path.dirname(newPath)):
+        logger.info(f"Creating path: {newPath}")
+        os.makedirs(os.path.dirname(newPath))
+ 
+def callAPIs():
+    pass
+ 
+def runCopyCommandCustomParserForUSFlex(source, tablename, filename):
+    with vconn.get_connection(source) as cn:
+        with open(filename, "rb") as fs:
+            cur = cn.cursor()
+            qry = "COPY {table} FROM STDIN PARSER fcsvparser(type='traditional', delimiter=',') ABORT ON ERROR ".format(
+                table=tablename)
+            cur.copy(qry, fs, buffer_size=65536)
+            cur.execute("COMMIT")
+            logger.info(qry)
+ 
+def updateDataTypeGuess(source, tablename):
+    logger.info(f"Grab current data types from {schema}.{tablename}_keys")
+    key_query = f"SELECT key_name, data_type_guess FROM {schema}.{tablename}_keys ORDER BY key_name ASC"
+    newData = vconn.runSQLForOutput(source, key_query)
+ 
+    logger.info(f"Grab current data types from {schema}.{tablename}_results")
+    result_query = f"""
+        SELECT COLUMN_NAME, DATA_TYPE
+        FROM columns
+        WHERE TABLE_SCHEMA = '{schema}'
+        AND TABLE_NAME = '{tablename}_results'
+        AND COLUMN_NAME NOT IN ('CSV_NAME', 'CAPTURE_DATE', 'API_NAME', 'ROW_ID')
+        ORDER BY COLUMN_NAME ASC
+    """
+    currentData = vconn.runSQLForOutput(source, result_query)
+ 
+    maxDataTypeDictionary = eval(currentConfig.get('dt'))
+ 
+    for newDts in newData:
+        newName, newType = newDts
+        currentDts = next((currentDts for currentDts in currentData if currentDts[0]
+                           == newName.replace('.', "_").replace('-', '_').replace('/', '_')), None)
+ 
+        if currentDts is None:
+            raise ValueError(f"No corresponding column found in new data for {newName}")
+ 
+        currentName, currentType = currentDts
+        logger.info(f'Current: {currentDts}')
+        logger.info(f'New: {newDts}')
+ 
+        datatype = currentType.split('(', 1)[0].lower()
+        logger.info(f"TYPE: {datatype}")
+ 
+        if datatype in ('numeric', 'varchar', 'char'):
+ 
+            newDatatype = newType.split('(', 1)[0].lower()
+            logger.info(f"NEW TYPE: {newDatatype}")
+            if newDatatype != datatype:
+                logger.error(f"Data type mismatch for column {newName}: Expected {datatype}, got {newDatatype}")
+                raise ValueError(f"Data type mismatch for column {newName}: Expected {datatype}, got {newDatatype}")
+ 
+            maxForType = int(maxDataTypeDictionary[datatype])
+            newValue, currentValue = map(lambda x: x.split('(')[1].split(')')[0], (newType, currentType))
+ 
+            if ',' in currentValue and ',' in newValue:
+                newInt, n_scale = map(int, newValue.split(','))
+                currentInt, c_scale = map(int, currentValue.split(','))
+            else:
+                newInt, currentInt = map(int, (newValue, currentValue))
+ 
+            newInt = newInt * 3
+            logger.info(f"NEW: {newInt}, CURRENT: {currentInt}")
+            if int(currentInt) == maxForType:
+                logger.info(f"Current is already at max for type.")
+                continue
+            elif int(currentInt) < int(newInt) < maxForType:
+                final_result = int(newInt)
+            elif int(newInt) <= int(currentInt) < maxForType:
+                logger.info(f"Key: {newInt} less than or equal to Result: {currentInt}")
+                continue
+            else:
+                logger.info(
+                    f"Updating result to max value, due to key: {newInt} "
+                    f"being larger than max value: {maxForType}")
+                final_result = maxForType
+ 
+            if ',' in currentValue and ',' in newValue:
+                final_result = f"{final_result},{c_scale}"
+            fullDatatype = f"{datatype}({final_result})"
+            column_name = currentName
+            logger.info(f"Final result of {fullDatatype} for column {column_name}")
+ 
+            alter_query = f"""
+                ALTER TABLE {schema}.{tablename}_results
+                ALTER COLUMN {column_name} SET DATA TYPE {fullDatatype}
+            """
+            vconn.runSQLCommand(source, alter_query)
+            logger.info(f"{tablename}_results updated")
+ 
+def runCopyCommand(source,tablename, filename,delimiter,quotechar,escape=None):
+    quote = ""
+    if quotechar == "'":
+        quote = "''''"
+    elif len(quotechar) > 0:
+        quote = "'" + quotechar + "'"
+    else:
+        quotechar = None
+ 
+    with vconn.get_connection(source) as cn:
+        with open(filename,"rb") as fs:
+            cur = cn.cursor()
+            qry = ""
+            if quotechar != None:
+                qry = """
+                COPY {table}
+                FROM STDIN
+                SKIP 1
+                DELIMITER '{delimiter}'
+                ENCLOSED BY {quotechar}
+                ABORT ON ERROR
+                """.format(table=tablename,delimiter=delimiter,quotechar=quote)
+            else:
+                qry = """
+                COPY {table}
+                FROM STDIN
+                SKIP 1
+                DELIMITER '{delimiter}'
+                ABORT ON ERROR
+                """.format(table=tablename,delimiter=delimiter)
+ 
+            if escape == None:
+                qry = qry + "NO ESCAPE"
+            else:
+                qry = qry + "ESCAPE AS E'{escape_char}'".format(escape_char = escape)
+            cur.copy(qry,fs,buffer_size=65536)
+            cur.execute("COMMIT")
+ 
+def insertCsvIntoFlex(source, flexTableName, fileDate, fullFileName):
+    logger.info('Inserting CSV Data')
+ 
+    create_table_query = f"""
+            DROP TABLE IF EXISTS {schema}.{flexTableName} CASCADE;
+            CREATE FLEX TABLE {schema}.{flexTableName}();
+        """
+    vconn.runSQLCommand(source, create_table_query)
+    logger.info("Run SQL Command")
+ 
+    logger.info("Run custom CSV parser")
+    runCopyCommandCustomParserForUSFlex(source, f'{schema}.{flexTableName}', stagePath + f'{flexTableName}.csv')
+    compute_keys_query = f"SELECT COMPUTE_FLEXTABLE_KEYS('{schema}.{flexTableName}')"
+    vconn.runSQLCommand(source, compute_keys_query)
+ 
+    existing_tables_query = f"""
+            SELECT table_name
+            FROM all_tables
+            WHERE schema_name='{schema}';
+        """
+    results_list = [item[0] for item in vconn.runSQLForOutput(source, existing_tables_query)]
+ 
+    if f'{flexTableName}_results' not in results_list:
+        logger.info(f'{flexTableName}_results was not found!')
+ 
+        # sequence_data_query = f"""
+        #         SELECT sequence_name
+        #         FROM sequences
+        #         WHERE sequence_schema='{schema}';
+        #     """
+        # seqs_list = [item[0] for item in vconn.runSQLForOutput(source, sequence_data_query)]
+ 
+        # if f'{flexTableName}_seq' not in seqs_list:
+        #     logger.info("Creating sequence for primary key")
+        #     create_sequence_query = f"""
+        #             CREATE SEQUENCE {schema}.{flexTableName}_seq
+        #             INCREMENT BY 1
+        #             START WITH 1
+        #             MINVALUE 1
+        #             MAXVALUE 999999999
+        #             CACHE 10
+        #             NO CYCLE
+        #         """
+        #     vconn.runSQLCommand(source, create_sequence_query)
+        #     logger.info("Sequence Created")
+ 
+        logger.info("Creating table")
+        create_table_query = f"""
+                CREATE TABLE {schema}.{flexTableName}_results (
+                    -- ROW_ID numeric(9,0) default {schema}.{flexTableName}_seq.nextval primary key,
+                    CSV_NAME VARCHAR(255),
+                    CAPTURE_DATE VARCHAR(255)
+                ) SEGMENTED BY hash(CSV_NAME, CAPTURE_DATE) ALL NODES
+            """
+        vconn.runSQLCommand(source, create_table_query)
+        logger.info("Table Created")
+ 
+    # Get missing columns from the flex table
+    logger.info("Finding Missing Columns")
+    missing_columns_query = f"""
+        SELECT KEY_NAME, DATA_TYPE_GUESS
+        FROM {schema}.{flexTableName}_keys
+        WHERE REPLACE(KEY_NAME, '.', '_') NOT IN (
+            SELECT COLUMN_NAME
+            FROM COLUMNS
+            WHERE TABLE_SCHEMA||'.'||TABLE_NAME = '{schema}.{flexTableName}_results'
+        )
+            AND REPLACE(KEY_NAME, '/', '_') NOT IN (
+                SELECT COLUMN_NAME
+                FROM COLUMNS
+                WHERE TABLE_SCHEMA||'.'||TABLE_NAME = '{schema}.{flexTableName}_results'
+            )
+    """
+    logger.info(missing_columns_query)
+    missing_columns = vconn.runSQLForOutput(source, missing_columns_query)
+    logger.info(f'Missing Columns: {missing_columns}')
+    # Alter results table to add missing columns
+    for missing_column_details in missing_columns:
+        logger.info(f'Add Column: {missing_column_details}')
+        column_name, data_type = missing_column_details[0], missing_column_details[1]
+        column_name = column_name.replace('.', "_").replace('-', '_').replace('/', '_')
+        alter_table_query = f"ALTER TABLE {schema}.{flexTableName}_results ADD {column_name} {data_type}"
+        vconn.runSQLCommand(source, alter_table_query)
+ 
+    # Get existing columns in the results table
+    logger.info("Gathering existing columns in the results table")
+    columns_query = f"""
+        SELECT COLUMN_NAME
+        FROM COLUMNS
+        WHERE TABLE_SCHEMA||'.'||TABLE_NAME = '{schema}.{flexTableName}_results'
+        AND COLUMN_NAME NOT IN ('ROW_ID', 'CSV_NAME', 'CAPTURE_DATE')
+        ORDER BY ORDINAL_POSITION
+    """
+    all_columns = vconn.runSQLForOutput(source, columns_query)
+    columns = [row[0] for row in all_columns]
+ 
+    # Construct file columns
+    file_columns = "CSV_NAME, CAPTURE_DATE, " + ", ".join(columns)
+ 
+    # Prepare detail header
+    detail_header = ["CSV_NAME", "CAPTURE_DATE"]
+    detail_header.extend(columns)
+    logger.info("Extending the detail table's header!")
+ 
+    # Prepare detail records
+    detail_records = [detail_header]
+    logger.info("Adding all of the headers to the details record list")
+ 
+    # TEST PLACEMENT
+    updateDataTypeGuess(source, flexTableName)
+ 
+    # Read CSV file and append data to detail records
+    with open(stagePath + f'{flexTableName}.csv', 'r', newline='', encoding="utf8") as in_file:
+        reader = csv.DictReader(in_file, delimiter=',')
+        for row in reader:
+            item_entry = [fullFileName, f'{fileDate} {datetime.datetime.now().strftime("%H:%M:%S")}']
+            item_entry.extend(row.get(column) for column in columns)
+            detail_records.append(item_entry)
+ 
+        # Write detail records to results CSV
+        with open(f'{flexTableName}_results.csv', 'w', newline='', encoding="utf-8") as f:
+            writer = csv.writer(f, delimiter=',')
+            writer.writerows(detail_records)
+        logger.info("Inserting the data into the table")
+ 
+        # Run Copy Command for inserting data into the results table
+        # runCopyCommandCustomParserForUS(
+        #     source, f'{schema}.{flexTableName}_results', f'{flexTableName}_results.csv', file_columns
+        # )
+        # vconn.runCopyCommand(source,f'{schema}.{flexTableName}_results', f'{flexTableName}_results.csv', ",",  "")
+        # runCopyCommand(source, f'{schema}.{flexTableName}_results', f'{flexTableName}_results.csv', file_columns, ',')
+        runCopyCommand(source, f'{schema}.{flexTableName}_results', f'{flexTableName}_results.csv', ',', '"')
+ 
+    # # Insert statistics into the stats table
+    # logger.info("Inserting Stats Into Stats Table")
+    # with open(f'stage/{fullFileName}', 'r', encoding="utf-8") as file_open:
+    #     non_empty_lines = [line.strip("\n") for line in file_open if line != "\n"]
+    #     line_count = len(non_empty_lines)
+    #
+    #     stats_query = f"""
+    #         INSERT INTO {schema}.{stats_table} (CSV_NAME, CSV_CAPTURE_DATE, CSV_ROW_COUNT)
+    #         VALUES ('{fullFileName}', '{datetime.datetime.today().strftime('%Y-%m-%d %H:%M:%S')}', {line_count - 1})
+    #     """
+    #     vconn.runSQLCommand(source, stats_query)
+ 
+def createCSV(dataFrame: pd.DataFrame, nameOfAPI: str):
+    """This function will take in a dataframe and then"""
+    logger.info("Starting createCSV function")
+    fileAbsPath = stagePath + nameOfAPI + ".csv"
+    dataFrame.to_csv(fileAbsPath, index=False)
+    logger.info("Finished createCSV function")
+ 
+def sentineloneGetSites(dataFrameRow):
+    logger.info("Starting sentineloneGetSites API")
+    apiName = dataFrameRow["APINAME"]
+    url = dataFrameRow["URL"]
+    headers = {
+        'Accept': 'application/json',
+        'Authorization': 'ApiToken eyJraWQiOiJ0b2tlblNpZ25pbmciLCJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJmaWJlcmJvdDAxQGNzcGlyZS5jb20iLCJpc3MiOiJhdXRobi11cy1lYXN0LTEtcHJvZCIsImRlcGxveW1lbnRfaWQiOiI0NzY2OSIsInR5cGUiOiJ1c2VyIiwiZXhwIjoxNzE3MDk1MDI0LCJqdGkiOiJlYmNkOWVkNS05YWFjLTQwNWQtOGMxZS0wYjJkMzYzYTEwMjgifQ.pV6KsobNuNm1NhfiRO4HAWgOKVx1p0tFF5tBKvGj_w-xkxutJ9piBqujbaG0ZbBwjnmQTQjdcQUerM1usIJsuw'
+    }
+    payload = {}
+    # Should take in account stuff like the cursor so that we can continue to parse ect
+    response = requests.request("GET", url, headers=headers, data=payload)
+    # logger.info(response.text)
+    data = response.json()
+    insideData = data['data']['sites']
+    # logger.info(insideData)
+    # headers = insideData['headers']
+    # headers = [s.replace(" ", "").replace("(", "").replace(")", "").replace("-","_").replace(".", "_").replace("/","_") for s in headers]
+    df = pd.DataFrame(insideData)
+    df["description"] = df["description"].apply(lambda x: f"{x}")
+    df["name"] = df["name"].apply(lambda x: f"{x}")
+    df['description'] = df['description'].str.replace('\n', ' ')
+    # df = df.applymap(lambda x: str(x).replace(',', '') if pd.notnull(x) else x)
+    # df["licenses"] = "testing"
+ 
+    logger.info(df.to_string())
+    logger.info("Finished sentineloneGetSites API")
+    return df
+ 
+def main():
+    logger.info("Grabbing a list of APIs to consume")
+    #TODO: make a function that grabs the apis and puts them in a dataframe, shoud be easy to do with verticaconnectors
+    ikey="DIXG92YF1ZOG7GSJUOGC"
+    skey="8Cbcmh6z5MaDpnwHjz6HAvh6cdyhesRNaDtHNIMl"
+    host="api-31b32878.duosecurity.com"
+    kwargs = {
+            'ikey': ikey,
+            'skey': skey,
+            'host': host,
+    }
+ 
+    account_client = duo.Accounts(ikey=ikey, skey=skey, host=host)
+    child_accounts = account_client.get_child_accounts()
+    logger.info(child_accounts)
+    if isinstance(child_accounts, list):
+        # Expected list of child accounts returned
+        for child_account in child_accounts:
+            if child_account['name'] == '22nd State Bank':
+                account_admin_api = duo_client.admin.AccountAdmin(
+                    child_account['account_id'],
+                    child_api_host=child_account['api_hostname'],
+                    **kwargs,
+                )
+                logger.info(child_account)
+                logger.info(account_admin_api.get_info_summary())
+    # admin_api = duo.Admin(ikey="DI29OGZ0VGI14H0CTZCO", skey="x0dfwiieDZ16vqgvrXu8ChMP2EVpr54RdO2owWDc", host="api-31b32878.duosecurity.com")
+    # admin_api.get_info_summary()
+    # admin_api = duo.Admin(ikey="DI29OGZ0VGI14H0CTZCO", skey="x0dfwiieDZ16vqgvrXu8ChMP2EVpr54RdO2owWDc", host="api-31b32878.duosecurity.com")
+    # logger.info(admin_api.)
+    # response = admin_api.get_policies_v2()
+    # pretty = json.dumps(response, indent=4, sort_keys=True, default=str)
+    # logger.info(pretty)
+    # for index, row in arrowAPIDataFrame.iterrows():
+    #     apiName = row['APINAME']
+    #     if apiName in api_functions:
+    #         apiInformationDataFrame = api_functions[apiName](row)
+    #         createCSV(apiInformationDataFrame, apiName)
+    #         insertCsvIntoFlex(source, apiName, '2024-02-09', apiName + '.csv')
+    #     else:
+    #         logger.warning("API function not found")
+    #         continue
+ 
+ 
+if __name__ == '__main__':
+    hostname = socket.gethostname()
+    processname = os.path.basename(__file__)[:-3]
+    abspath = os.path.abspath(__file__)
+    dname = os.path.dirname(abspath)
+    today = datetime.datetime.now().strftime("%m%d%y")
+    config = configurator(processname, dname)
+ 
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-s", "--source", help="Vertica Database to Use", type=str, default="verticat")
+    parser.add_argument("--environment", help="Used to override the default environment used in .ini file.",
+                        type=str, default="DEFAULT")
+    argvs = parser.parse_args()
+    currentConfig = config[argvs.environment]
+    source = parser.parse_args().__dict__["source"]
+ 
+    # connection = oracledb.connect(user=currentConfig.get('MMUser'), password=currentConfig.get('MMPassword'),
+    #                               dsn=currentConfig.get('MMHost') + ':' + currentConfig.get('MMPort') + '/' + currentConfig.get('MMDB'))
+ 
+    api_functions = {
+        "sentineloneGetSites": sentineloneGetSites
+    }
+ 
+    logger = loggingFunction(processname, dname, today)
+    logger.info("Starting csbApiConsumption")
+    stagePath = dname + '/stage/'
+    archiveDir = dname + '/archive/'
+    erroredDir = dname + '/errored/'
+    schema = 'MEDIATION'
+    makePath(stagePath)
+    makePath(archiveDir)
+ 
+    data = [[1, 'sentineloneGetSites', 'https://usea1-001-mssp.sentinelone.net//web/api/v2.1/sites?limit=1000', 1], [2, 'Arrow_ExportSync', '/billing/erp/exports/sync', 1]]
+    columns = ['ID', 'APINAME', 'URL', 'Active']
+    arrowAPIDataFrame = pd.DataFrame(data, columns=columns)
+    main()
+    logger.info("Finished csbApiConsumption")
+    # oracleCursoer = connection.cursor()
+    print("Script start")
+    print("script finish")
